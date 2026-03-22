@@ -1,602 +1,362 @@
 // Copyright CodeGamified 2025-2026
 // MIT License — Rubik
+using System.Collections;
 using System.Collections.Generic;
-using System.Text;
 using UnityEngine;
-using CodeGamified.Quality;
-using CodeGamified.Time;
+using CodeGamified.Procedural;
 
 namespace Rubik.Game
 {
     /// <summary>
-    /// 3D Rubik's Cube renderer with smooth face-rotation animation.
-    ///
-    /// ARCHITECTURE — two decoupled representations kept in sync:
-    ///
-    ///   LOGICAL (RubikCube): 54 ints in _stickers[face, pos].
-    ///     Permuted instantly by RotateFace().
-    ///
-    ///   PHYSICAL (this class): 26 cubie GameObjects on a 3×3×3 grid.
-    ///     Each cubie has 1-3 sticker-quad children whose material color
-    ///     is the *truth* for what the player sees.
-    ///
-    /// On a face rotation:
-    ///   1. OnFaceRotating fires BEFORE the logical permutation.
-    ///   2. We reparent the 9 layer cubies under a pivot and animate a
-    ///      90° rotation.  Sticker quads ride with their cubies — fully
-    ///      visible throughout.
-    ///   3. After the animation completes we snap cubies to the grid,
-    ///      reset their rotations to identity, and recreate sticker quads
-    ///      from the logical state (already permuted).  Single-sided quads
-    ///      face wrong directions after physical rotation, so repainting
-    ///      is required.
-    ///
-    /// On a non-animated state change (scramble / reset) the
-    /// OnCubeChanged event fires and we do a full rebuild: destroy all
-    /// cubie GameObjects and recreate them from scratch with the correct
-    /// colors read from the logical state.  This is cheap (happens once
-    /// per scramble, not per frame) and avoids any index desync.
+    /// Visual renderer + queue-based animator for the Rubik's Cube.
+    /// Builds cubie geometry via ProceduralAssembler. Animates face rotations
+    /// with pivot parenting. No state logic — purely cosmetic.
     /// </summary>
-    public class RubikRenderer : MonoBehaviour, IQualityResponsive
+    public class RubikRenderer : MonoBehaviour
     {
-        private RubikCube _cube;
+        // ═══════════════════════════════════════════════════════════════
+        // CONFIG
+        // ═══════════════════════════════════════════════════════════════
 
-        public const float CubeSize = 1.0f;
-        private const float Gap = 0.05f;
-        private const float StickerInset = 0.02f;
-
-        // 3×3×3 grid index; rebuilt from world positions after each animation.
-        private GameObject[,,] _cubies;
-
-        /// <summary>True while a face-rotation animation is playing.</summary>
-        public bool IsAnimating => _animating;
-
-        // ── Animation state ──
-        private const float BaseAnimDuration = 0.2f;
-        private bool _animating;
-        private float _animElapsed;
-        private float _animDuration;
-        private Vector3 _animAxis;
-        private float _animTargetAngle;
-        private Transform _animPivot;
-        private readonly List<Transform> _animCubies = new List<Transform>();
-
-        // True when the logical state changed without animation (scramble/reset).
-        // Cleared after a full rebuild.
-        private bool _needsFullRebuild;
-        // Set by OnFaceRotating, consumed by OnCubeChanged, to distinguish
-        // the animated RotateFace's OnCubeChanged from a scramble/reset.
-        private bool _expectingAnimatedChange;
-
-        // ── Colors ──
-        private static readonly Color[] StickerColors =
-        {
-            new Color(1f, 1f, 1f),                  // U white
-            new Color(1f, 1f, 0f),                  // D yellow
-            new Color(0f, 1f, 0.3f),                // F green
-            new Color(0.3f, 0.5f, 1f),              // B blue
-            new Color(1f, 0.6f, 0f),                // L orange
-            new Color(1f, 0.1f, 0.1f),              // R red
-        };
-        private static readonly Color CubieColor = new Color(0.05f, 0.05f, 0.08f);
+        private const float CubieSize = 0.9f;
+        private const float StickerSize = 0.8f;
+        private const float StickerOffset = 0.451f;
+        private const float AnimDuration = 0.25f;
 
         // ═══════════════════════════════════════════════════════════════
-        // LIFECYCLE
+        // STATE
+        // ═══════════════════════════════════════════════════════════════
+
+        private RubikCube _cube;
+        private ColorPalette _palette;
+        private Shader _shader;
+
+        // Visual GO for each cubie: keyed by RubikCubie instance
+        private Dictionary<RubikCubie, GameObject> _visuals = new();
+
+        // Animation queue
+        private readonly Queue<AnimRequest> _queue = new();
+        private bool _animating;
+
+        public bool IsBusy => _animating || _queue.Count > 0;
+
+        struct AnimRequest
+        {
+            public RubikCubie[] Cubies;
+            public Vector3 Axis;
+            public float Angle;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // INIT
         // ═══════════════════════════════════════════════════════════════
 
         public void Initialize(RubikCube cube)
         {
             _cube = cube;
+            _palette = BuildPalette();
+            _shader = FindShader();
 
-            var pivotGO = new GameObject("RotationPivot");
-            pivotGO.transform.SetParent(transform, false);
-            pivotGO.transform.localPosition = Vector3.zero;
-            _animPivot = pivotGO.transform;
-
-            _cubies = new GameObject[3, 3, 3];
-            BuildCubeFromState();
+            BuildVisuals();
 
             _cube.OnFaceRotating += OnFaceRotating;
             _cube.OnCubeChanged += OnCubeChanged;
-            QualityBridge.Register(this);
         }
 
-        private void OnDisable() => QualityBridge.Unregister(this);
-        public void OnQualityChanged(QualityTier tier) { }
-
-        private void Update()
+        private void OnDestroy()
         {
-            if (_animating) UpdateAnimation();
+            if (_cube != null)
+            {
+                _cube.OnFaceRotating -= OnFaceRotating;
+                _cube.OnCubeChanged -= OnCubeChanged;
+            }
         }
-
-        private void LateUpdate()
-        {
-            if (_animating) return;
-            if (!_needsFullRebuild) return;
-            _needsFullRebuild = false;
-            FullRebuild();
-        }
-
-        public void MarkDirty() => _needsFullRebuild = true;
 
         // ═══════════════════════════════════════════════════════════════
-        // CUBE CHANGED (non-animated: scramble, reset, external)
+        // VISUAL CONSTRUCTION (ProceduralAssembler)
         // ═══════════════════════════════════════════════════════════════
+
+        private void BuildVisuals()
+        {
+            // Destroy previous visuals
+            foreach (var kv in _visuals)
+                if (kv.Value != null) Destroy(kv.Value);
+            _visuals.Clear();
+
+            int n = RubikCube.N;
+            for (int x = 0; x < n; x++)
+                for (int y = 0; y < n; y++)
+                    for (int z = 0; z < n; z++)
+                    {
+                        var cubie = _cube.GetCubieAt(x, y, z);
+                        if (cubie == null) continue;
+
+                        var blueprint = new CubieBlueprint(cubie, x, y, z);
+                        var result = ProceduralAssembler.Build(blueprint, _palette, _shader);
+                        if (result.Root == null) continue;
+
+                        result.Root.transform.SetParent(transform, false);
+                        result.Root.transform.localPosition = RubikCube.GridToLocal(x, y, z);
+                        _visuals[cubie] = result.Root;
+                    }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // CUBIE BLUEPRINT (IProceduralBlueprint)
+        // ═══════════════════════════════════════════════════════════════
+
+        private class CubieBlueprint : IProceduralBlueprint
+        {
+            private readonly RubikCubie _cubie;
+            private readonly int _x, _y, _z;
+
+            public CubieBlueprint(RubikCubie cubie, int x, int y, int z)
+            {
+                _cubie = cubie;
+                _x = x; _y = y; _z = z;
+            }
+
+            public string DisplayName => $"Cubie_{_x}_{_y}_{_z}";
+            public string PaletteId => "rubik";
+            public ProceduralLODHint LODHint => ProceduralLODHint.Lightweight;
+
+            public ProceduralPartDef[] GetParts()
+            {
+                var parts = new List<ProceduralPartDef>();
+
+                // Body — dark cube
+                parts.Add(new ProceduralPartDef("body", PrimitiveType.Cube,
+                    Vector3.zero, Vector3.one * CubieSize, "cubie_black"));
+
+                // Stickers — colored quads on exposed faces
+                int n = RubikCube.N;
+                int last = n - 1;
+                int idx = 0;
+
+                void TrySticker(bool condition, Vector3 normal, int faceIndex)
+                {
+                    if (!condition) return;
+                    var rot = QuadRotation(normal);
+                    parts.Add(new ProceduralPartDef(
+                        $"sticker_{idx++}", PrimitiveType.Quad,
+                        normal * StickerOffset,
+                        new Vector3(StickerSize, StickerSize, 1f),
+                        rot,
+                        RubikCube.FaceColorKeys[faceIndex],
+                        "sticker", ColliderMode.None, "body"));
+                }
+
+                TrySticker(_y == last, Vector3.up, RubikCube.U);
+                TrySticker(_y == 0,    Vector3.down, RubikCube.D);
+                TrySticker(_z == last, Vector3.forward, RubikCube.F);
+                TrySticker(_z == 0,    Vector3.back, RubikCube.B);
+                TrySticker(_x == 0,    Vector3.left, RubikCube.L);
+                TrySticker(_x == last, Vector3.right, RubikCube.R);
+
+                return parts.ToArray();
+            }
+        }
 
         /// <summary>
-        /// OnCubeChanged fires after EVERY state change, including animated
-        /// rotations.  We only want a full rebuild for non-animated changes.
-        /// Animated rotations are self-contained: the physical state matches
-        /// the logical state after FinishAnimation, no repaint needed.
+        /// Rotation to make a quad face the given direction.
+        /// Unity Quad default normal is +Z (forward).
         /// </summary>
+        private static Quaternion QuadRotation(Vector3 normal)
+        {
+            if (normal == Vector3.up)      return Quaternion.Euler(-90f, 0f, 0f);
+            if (normal == Vector3.down)    return Quaternion.Euler(90f, 0f, 0f);
+            if (normal == Vector3.forward) return Quaternion.identity;
+            if (normal == Vector3.back)    return Quaternion.Euler(0f, 180f, 0f);
+            if (normal == Vector3.left)    return Quaternion.Euler(0f, -90f, 0f);
+            if (normal == Vector3.right)   return Quaternion.Euler(0f, 90f, 0f);
+            return Quaternion.LookRotation(normal);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // ANIMATION
+        // ═══════════════════════════════════════════════════════════════
+
+        private void OnFaceRotating(int face, int direction, RubikCubie[] layerCubies, Vector3 axis)
+        {
+            _queue.Enqueue(new AnimRequest
+            {
+                Cubies = layerCubies,
+                Axis = axis,
+                Angle = direction * 90f
+            });
+
+            if (!_animating)
+                StartCoroutine(ProcessQueue());
+        }
+
         private void OnCubeChanged()
         {
-            if (_expectingAnimatedChange)
-            {
-                // This is the OnCubeChanged from a RotateFace that we're
-                // already animating.  Physical state is handled by the
-                // animation system — no rebuild needed.
-                _expectingAnimatedChange = false;
-                return;
-            }
-            _needsFullRebuild = true;
+            // Snap positions after state change (handles ResetToSolved).
+            // Only snap when not animating — animation handles its own snapping.
+            if (!_animating && _queue.Count == 0)
+                RebuildIfNeeded();
         }
 
-        /// <summary>
-        /// Destroy all cubies and recreate from the current logical state.
-        /// Used after scramble / reset / any non-animated state change.
-        /// </summary>
-        private void FullRebuild()
+        private void RebuildIfNeeded()
         {
-            DestroyAllCubies();
-            BuildCubeFromState();
-        }
-
-        private void DestroyAllCubies()
-        {
-            if (_cubies == null) return;
-            for (int x = 0; x < 3; x++)
-            for (int y = 0; y < 3; y++)
-            for (int z = 0; z < 3; z++)
-            {
-                if (_cubies[x, y, z] != null)
-                {
-                    DestroyImmediate(_cubies[x, y, z]);
-                    _cubies[x, y, z] = null;
-                }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // ANIMATION — cubies + stickers rotate together, nothing hidden
-        // ═══════════════════════════════════════════════════════════════
-
-        /// <summary>
-        /// Called BEFORE the logical sticker permutation.  Cubies are still
-        /// at their pre-move grid positions, so GatherLayerCubies picks the
-        /// correct 9.
-        /// </summary>
-        private void OnFaceRotating(int face, int direction)
-        {
-            if (_animating)
-                FinishAnimationInstant();
-            // Mark that the next OnCubeChanged is from this animated rotation
-            // and should NOT trigger a full rebuild.
-            _expectingAnimatedChange = true;
-            StartAnimation(face, direction);
-        }
-
-        private void StartAnimation(int face, int direction)
-        {
-            _animElapsed = 0f;
-
-            float ts = SimulationTime.Instance?.timeScale ?? 1f;
-            _animDuration = ts > 5f
-                ? BaseAnimDuration / Mathf.Min(ts * 0.2f, 10f)
-                : BaseAnimDuration;
-
-            _animAxis = FaceAxis(face);
-            bool flipSign = face == RubikCube.D || face == RubikCube.B || face == RubikCube.L;
-            float cwAngle = flipSign ? 90f : -90f;
-            _animTargetAngle = direction == 1 ? cwAngle : -cwAngle;
-
-            _animPivot.localPosition = Vector3.zero;
-            _animPivot.localRotation = Quaternion.identity;
-
-            _animCubies.Clear();
-            GatherLayerCubies(face, _animCubies);
-            foreach (var c in _animCubies)
-                c.SetParent(_animPivot, true);
-
-            _animating = true;
-        }
-
-        private void UpdateAnimation()
-        {
-            _animElapsed += Time.deltaTime;
-            float t = Mathf.Clamp01(_animElapsed / _animDuration);
-
-            float eased = t < 0.5f
-                ? 2f * t * t
-                : 1f - Mathf.Pow(-2f * t + 2f, 2f) * 0.5f;
-
-            _animPivot.localRotation =
-                Quaternion.AngleAxis(eased * _animTargetAngle, _animAxis);
-
-            if (t >= 1f)
-                FinishAnimation();
-        }
-
-        /// <summary>
-        /// Snap cubies to grid, reset rotations, recreate sticker quads
-        /// from the logical state so every quad faces outward correctly.
-        /// </summary>
-        private void FinishAnimation()
-        {
-            _animPivot.localRotation =
-                Quaternion.AngleAxis(_animTargetAngle, _animAxis);
-
-            foreach (var c in _animCubies)
-            {
-                c.SetParent(transform, true);
-                c.localPosition = SnapToGrid(c.localPosition);
-            }
-
-            // Snapshot before clearing
-            var moved = new List<Transform>(_animCubies);
-            _animCubies.Clear();
-            _animPivot.localRotation = Quaternion.identity;
-            _animating = false;
-
-            RebuildCubieIndex();
-
-            // Reset rotation and recreate sticker quads from logical state.
-            // Single-sided quads face wrong directions after physical rotation;
-            // the logical state (already permuted) is the authoritative source.
-            foreach (var c in moved)
-            {
-                c.localRotation = Quaternion.identity;
-                DestroyChildStickers(c);
-                var (x, y, z) = GridFromLocalPos(c.localPosition);
-                AttachStickers(x, y, z, c.gameObject);
-            }
-
-            // Prevent redundant FullRebuild from MarkDirty calls
-            // triggered by the match manager's event chain.
-            _needsFullRebuild = false;
-
-            DumpPhysical();
-        }
-
-        private void FinishAnimationInstant()
-        {
-            if (!_animating) return;
-            FinishAnimation();
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // DEBUG — physical cubie state
-        // ═══════════════════════════════════════════════════════════════
-
-        private void DumpPhysical()
-        {
-            var sb = new StringBuilder();
-            sb.Append("[RUBIK-PHYS] Cubie grid after animation:\n");
-            float step = CubeSize + Gap;
-            float offset = -step;
-            for (int x = 0; x < 3; x++)
-            for (int y = 0; y < 3; y++)
-            for (int z = 0; z < 3; z++)
-            {
-                var cubie = _cubies[x, y, z];
-                if (cubie == null) continue;
-                var t = cubie.transform;
-                sb.Append($"  [{x},{y},{z}] pos={t.localPosition:F2} rot={t.localRotation.eulerAngles:F0}");
-                // List sticker children and their world-forward directions
-                for (int i = 0; i < t.childCount; i++)
-                {
-                    var child = t.GetChild(i);
-                    // Get the quad's -Z direction in renderer-local space
-                    Vector3 worldN = child.TransformDirection(Vector3.back);
-                    Vector3 localN = transform.InverseTransformDirection(worldN);
-                    // Read current material color
-                    string colorLabel = "?";
-                    var rend = child.GetComponent<Renderer>();
-                    if (rend != null)
+            // Check if visuals still map to valid cubies; if not, full rebuild.
+            int n = RubikCube.N;
+            bool needsRebuild = false;
+            for (int x = 0; x < n && !needsRebuild; x++)
+                for (int y = 0; y < n && !needsRebuild; y++)
+                    for (int z = 0; z < n && !needsRebuild; z++)
                     {
-                        Color c = rend.material.HasProperty("_BaseColor")
-                            ? rend.material.GetColor("_BaseColor")
-                            : rend.material.color;
-                        colorLabel = MatchColorLabel(c);
+                        var cubie = _cube.GetCubieAt(x, y, z);
+                        if (cubie != null && !_visuals.ContainsKey(cubie))
+                            needsRebuild = true;
                     }
-                    sb.Append($" [{colorLabel}→{FormatDir(localN)}]");
-                }
-                sb.Append('\n');
+
+            if (needsRebuild)
+                BuildVisuals();
+        }
+
+        private IEnumerator ProcessQueue()
+        {
+            _animating = true;
+            while (_queue.Count > 0)
+            {
+                var req = _queue.Dequeue();
+                yield return AnimateRotation(req);
             }
-            Debug.Log(sb.ToString());
+            _animating = false;
         }
 
-        private static string MatchColorLabel(Color c)
+        private IEnumerator AnimateRotation(AnimRequest req)
         {
-            float bestDist = float.MaxValue;
-            int bestIdx = -1;
-            for (int i = 0; i < StickerColors.Length; i++)
+            // Create pivot at cube center
+            var pivot = new GameObject("Pivot");
+            pivot.transform.SetParent(transform, false);
+            pivot.transform.localPosition = Vector3.zero;
+
+            // Parent visual GOs to pivot
+            var movedVisuals = new List<(RubikCubie cubie, GameObject visual)>();
+            for (int i = 0; i < req.Cubies.Length; i++)
             {
-                float dist = (c.r - StickerColors[i].r) * (c.r - StickerColors[i].r)
-                           + (c.g - StickerColors[i].g) * (c.g - StickerColors[i].g)
-                           + (c.b - StickerColors[i].b) * (c.b - StickerColors[i].b);
-                if (dist < bestDist) { bestDist = dist; bestIdx = i; }
-            }
-            if (bestDist > 0.1f) return "?";
-            return RubikCube.FaceNames[bestIdx];
-        }
-
-        private static string FormatDir(Vector3 v)
-        {
-            if (v.y >  0.9f) return "+Y";
-            if (v.y < -0.9f) return "-Y";
-            if (v.z >  0.9f) return "+Z";
-            if (v.z < -0.9f) return "-Z";
-            if (v.x >  0.9f) return "+X";
-            if (v.x < -0.9f) return "-X";
-            return $"({v.x:F1},{v.y:F1},{v.z:F1})";
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // STICKER REPAINT HELPERS
-        // ═══════════════════════════════════════════════════════════════
-
-        private static void DestroyChildStickers(Transform cubie)
-        {
-            for (int i = cubie.childCount - 1; i >= 0; i--)
-                DestroyImmediate(cubie.GetChild(i).gameObject);
-        }
-
-        private (int x, int y, int z) GridFromLocalPos(Vector3 pos)
-        {
-            float step = CubeSize + Gap;
-            float offset = -step;
-            int x = Mathf.Clamp(Mathf.RoundToInt((pos.x - offset) / step), 0, 2);
-            int y = Mathf.Clamp(Mathf.RoundToInt((pos.y - offset) / step), 0, 2);
-            int z = Mathf.Clamp(Mathf.RoundToInt((pos.z - offset) / step), 0, 2);
-            return (x, y, z);
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // GRID INDEX
-        // ═══════════════════════════════════════════════════════════════
-
-        private void RebuildCubieIndex()
-        {
-            float step = CubeSize + Gap;
-            float offset = -step;
-
-            for (int x = 0; x < 3; x++)
-                for (int y = 0; y < 3; y++)
-                    for (int z = 0; z < 3; z++)
-                        _cubies[x, y, z] = null;
-
-            foreach (Transform child in transform)
-            {
-                if (child == _animPivot) continue;
-                if (!child.name.StartsWith("Cubie_")) continue;
-
-                Vector3 p = child.localPosition;
-                int xi = Mathf.Clamp(Mathf.RoundToInt((p.x - offset) / step), 0, 2);
-                int yi = Mathf.Clamp(Mathf.RoundToInt((p.y - offset) / step), 0, 2);
-                int zi = Mathf.Clamp(Mathf.RoundToInt((p.z - offset) / step), 0, 2);
-                _cubies[xi, yi, zi] = child.gameObject;
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // LAYER GATHER
-        // ═══════════════════════════════════════════════════════════════
-
-        private static Vector3 FaceAxis(int face)
-        {
-            return face switch
-            {
-                RubikCube.U or RubikCube.D => Vector3.up,
-                RubikCube.F or RubikCube.B => Vector3.forward,
-                RubikCube.L or RubikCube.R => Vector3.right,
-                _ => Vector3.up
-            };
-        }
-
-        private void GatherLayerCubies(int face, List<Transform> result)
-        {
-            float step = CubeSize + Gap;
-            float threshold = step * 0.4f;
-
-            float target = face switch
-            {
-                RubikCube.U =>  step,
-                RubikCube.D => -step,
-                RubikCube.F =>  step,
-                RubikCube.B => -step,
-                RubikCube.L => -step,
-                RubikCube.R =>  step,
-                _ => 0f
-            };
-
-            for (int x = 0; x < 3; x++)
-            for (int y = 0; y < 3; y++)
-            for (int z = 0; z < 3; z++)
-            {
-                var cubie = _cubies[x, y, z];
-                if (cubie == null) continue;
-
-                float coord = face switch
+                var cubie = req.Cubies[i];
+                if (cubie != null && _visuals.TryGetValue(cubie, out var visual))
                 {
-                    RubikCube.U or RubikCube.D => cubie.transform.localPosition.y,
-                    RubikCube.F or RubikCube.B => cubie.transform.localPosition.z,
-                    RubikCube.L or RubikCube.R => cubie.transform.localPosition.x,
-                    _ => 0f
-                };
-
-                if (Mathf.Abs(coord - target) < threshold)
-                    result.Add(cubie.transform);
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // GRID SNAP
-        // ═══════════════════════════════════════════════════════════════
-
-        private Vector3 SnapToGrid(Vector3 pos)
-        {
-            float step = CubeSize + Gap;
-            float offset = -step;
-            pos.x = offset + Mathf.Round((pos.x - offset) / step) * step;
-            pos.y = offset + Mathf.Round((pos.y - offset) / step) * step;
-            pos.z = offset + Mathf.Round((pos.z - offset) / step) * step;
-            return pos;
-        }
-
-        private static Quaternion SnapRotation(Quaternion rot)
-        {
-            Vector3 e = rot.eulerAngles;
-            e.x = Mathf.Round(e.x / 90f) * 90f;
-            e.y = Mathf.Round(e.y / 90f) * 90f;
-            e.z = Mathf.Round(e.z / 90f) * 90f;
-            return Quaternion.Euler(e);
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // BUILD — create 26 cubies + sticker quads from logical state
-        // ═══════════════════════════════════════════════════════════════
-
-        private void BuildCubeFromState()
-        {
-            float step = CubeSize + Gap;
-            float offset = -step;
-
-            for (int x = 0; x < 3; x++)
-            for (int y = 0; y < 3; y++)
-            for (int z = 0; z < 3; z++)
-            {
-                if (x == 1 && y == 1 && z == 1) continue;
-
-                var cubie = CreateCubie($"Cubie_{x}{y}{z}");
-                cubie.transform.SetParent(transform, false);
-                cubie.transform.localPosition = new Vector3(
-                    offset + x * step,
-                    offset + y * step,
-                    offset + z * step);
-                cubie.transform.localScale = Vector3.one * CubeSize;
-                _cubies[x, y, z] = cubie;
-
-                AttachStickers(x, y, z, cubie);
-            }
-        }
-
-        /// <summary>
-        /// Create sticker quads for every exposed face of the cubie at grid
-        /// (x,y,z) and paint each with the color from the current logical
-        /// state.  After this call, the cubie is a self-contained physical
-        /// object whose visible colors match the logical model.
-        /// </summary>
-        private void AttachStickers(int x, int y, int z, GameObject cubie)
-        {
-            float half = CubeSize * 0.5f + StickerInset;
-            float sz = CubeSize * 0.85f;
-
-            if (y == 2) // U face
-            {
-                int pos = (2 - z) * 3 + x;
-                var q = MakeQuad(cubie, new Vector3(0, half, 0),
-                    Quaternion.Euler(90, 0, 0), sz);
-                PaintQuad(q, _cube.GetSticker(RubikCube.U, pos));
-            }
-            if (y == 0) // D face
-            {
-                int pos = z * 3 + x;
-                var q = MakeQuad(cubie, new Vector3(0, -half, 0),
-                    Quaternion.Euler(-90, 0, 0), sz);
-                PaintQuad(q, _cube.GetSticker(RubikCube.D, pos));
-            }
-            if (z == 2) // F face
-            {
-                int pos = (2 - y) * 3 + x;
-                var q = MakeQuad(cubie, new Vector3(0, 0, half),
-                    Quaternion.Euler(0, 180, 0), sz);
-                PaintQuad(q, _cube.GetSticker(RubikCube.F, pos));
-            }
-            if (z == 0) // B face
-            {
-                int pos = (2 - y) * 3 + (2 - x);
-                var q = MakeQuad(cubie, new Vector3(0, 0, -half),
-                    Quaternion.identity, sz);
-                PaintQuad(q, _cube.GetSticker(RubikCube.B, pos));
-            }
-            if (x == 0) // L face
-            {
-                int pos = (2 - y) * 3 + (2 - z);
-                var q = MakeQuad(cubie, new Vector3(-half, 0, 0),
-                    Quaternion.Euler(0, 90, 0), sz);
-                PaintQuad(q, _cube.GetSticker(RubikCube.L, pos));
-            }
-            if (x == 2) // R face
-            {
-                int pos = (2 - y) * 3 + z;
-                var q = MakeQuad(cubie, new Vector3(half, 0, 0),
-                    Quaternion.Euler(0, -90, 0), sz);
-                PaintQuad(q, _cube.GetSticker(RubikCube.R, pos));
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // HELPERS
-        // ═══════════════════════════════════════════════════════════════
-
-        private GameObject CreateCubie(string name)
-        {
-            var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            go.name = name;
-            var col = go.GetComponent<Collider>();
-            if (col != null) Destroy(col);
-            SetColor(go, CubieColor);
-            return go;
-        }
-
-        private GameObject MakeQuad(GameObject parent,
-            Vector3 localPos, Quaternion localRot, float size)
-        {
-            var go = GameObject.CreatePrimitive(PrimitiveType.Quad);
-            go.name = "Sticker";
-            go.transform.SetParent(parent.transform, false);
-            go.transform.localPosition = localPos;
-            go.transform.localRotation = localRot;
-            go.transform.localScale = Vector3.one * size;
-            var col = go.GetComponent<Collider>();
-            if (col != null) Destroy(col);
-            return go;
-        }
-
-        private void PaintQuad(GameObject quad, int colorIdx)
-        {
-            if (colorIdx >= 0 && colorIdx < StickerColors.Length)
-                SetColor(quad, StickerColors[colorIdx]);
-        }
-
-        private static void SetColor(GameObject go, Color color)
-        {
-            var r = go.GetComponent<Renderer>();
-            if (r == null) return;
-            var mat = r.material;
-            if (mat.HasProperty("_BaseColor"))
-            {
-                mat.SetColor("_BaseColor", color);
-                if (mat.HasProperty("_EmissionColor"))
-                {
-                    mat.EnableKeyword("_EMISSION");
-                    mat.SetColor("_EmissionColor", color * 0.3f);
+                    visual.transform.SetParent(pivot.transform, true);
+                    movedVisuals.Add((cubie, visual));
                 }
             }
-            else
+
+            // Interpolate rotation
+            Quaternion startRot = Quaternion.identity;
+            Quaternion endRot = Quaternion.AngleAxis(req.Angle, req.Axis);
+            float elapsed = 0f;
+
+            while (elapsed < AnimDuration)
             {
-                mat.color = color;
+                elapsed += Time.deltaTime;
+                float t = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / AnimDuration));
+                pivot.transform.localRotation = Quaternion.Slerp(startRot, endRot, t);
+                yield return null;
+            }
+
+            // Final rotation
+            pivot.transform.localRotation = endRot;
+
+            // Unparent and snap to grid target positions
+            for (int i = 0; i < movedVisuals.Count; i++)
+            {
+                var (cubie, visual) = movedVisuals[i];
+                visual.transform.SetParent(transform, true);
+                // Snap to the cubie's new grid position
+                visual.transform.localPosition = _cube.GetCubieTargetPosition(cubie);
+                // Snap rotation to clean values (avoid floating-point drift)
+                visual.transform.localRotation = SnapRotation(visual.transform.localRotation);
+            }
+
+            Destroy(pivot);
+        }
+
+        /// <summary>Snap euler angles to nearest 90° to prevent drift.</summary>
+        private static Quaternion SnapRotation(Quaternion q)
+        {
+            Vector3 euler = q.eulerAngles;
+            euler.x = Mathf.Round(euler.x / 90f) * 90f;
+            euler.y = Mathf.Round(euler.y / 90f) * 90f;
+            euler.z = Mathf.Round(euler.z / 90f) * 90f;
+            return Quaternion.Euler(euler);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // PALETTE + SHADER
+        // ═══════════════════════════════════════════════════════════════
+
+        private static ColorPalette BuildPalette()
+        {
+            return ColorPalette.CreateRuntime(new Dictionary<string, Color>
+            {
+                { "cubie_black", new Color(0.08f, 0.08f, 0.08f) },
+                { "white",      Color.white },
+                { "yellow",     Color.yellow },
+                { "green",      new Color(0f, 0.8f, 0f) },
+                { "blue",       new Color(0f, 0.3f, 1f) },
+                { "orange",     new Color(1f, 0.5f, 0f) },
+                { "red",        new Color(0.9f, 0f, 0f) },
+            });
+        }
+
+        private static Shader FindShader()
+        {
+            var s = Shader.Find("Universal Render Pipeline/Unlit");
+            if (s != null) return s;
+            s = Shader.Find("Universal Render Pipeline/Lit");
+            if (s != null) return s;
+            return Shader.Find("Standard");
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // EMISSION PULSE (used by MatchManager start sequence)
+        // ═══════════════════════════════════════════════════════════════
+
+        public IEnumerator PulseEmission(float duration)
+        {
+            // Gather all sticker renderers
+            var renderers = new List<Renderer>();
+            foreach (var kv in _visuals)
+            {
+                if (kv.Value == null) continue;
+                var childRenderers = kv.Value.GetComponentsInChildren<Renderer>();
+                renderers.AddRange(childRenderers);
+            }
+
+            // Pulse: ramp emission up then down
+            float half = duration * 0.5f;
+            float elapsed = 0f;
+            var block = new MaterialPropertyBlock();
+
+            while (elapsed < duration)
+            {
+                elapsed += Time.deltaTime;
+                float t = elapsed < half
+                    ? elapsed / half
+                    : 1f - (elapsed - half) / half;
+                t = Mathf.Clamp01(t);
+
+                Color emissive = Color.white * t * 2f;
+                block.SetColor("_EmissionColor", emissive);
+
+                for (int i = 0; i < renderers.Count; i++)
+                {
+                    if (renderers[i] != null)
+                        renderers[i].SetPropertyBlock(block);
+                }
+                yield return null;
+            }
+
+            // Clear
+            block.SetColor("_EmissionColor", Color.black);
+            for (int i = 0; i < renderers.Count; i++)
+            {
+                if (renderers[i] != null)
+                    renderers[i].SetPropertyBlock(block);
             }
         }
     }

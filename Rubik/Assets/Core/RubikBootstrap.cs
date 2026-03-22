@@ -290,13 +290,11 @@ namespace Rubik.Core
                 _match.OnMatchStarted += () =>
                 {
                     Log("MATCH STARTED — Cube scrambled, solve it!");
-                    _renderer?.MarkDirty();
                 };
 
                 _match.OnScoreChanged += score =>
                 {
                     Log($"Score: {score} │ Stickers: {_cube.SolvedStickerCount()}/54 │ Faces: {_cube.SolvedFaceCount()}/6");
-                    _renderer?.MarkDirty();
                 };
 
                 _match.OnSolved += () =>
@@ -310,8 +308,6 @@ namespace Rubik.Core
                     if (autoRestart)
                         StartCoroutine(RestartAfterDelay());
                 };
-
-                _match.OnCubeChanged += () => _renderer?.MarkDirty();
             }
         }
 

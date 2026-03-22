@@ -46,17 +46,58 @@ namespace Rubik.Game
 
         public void StartMatch()
         {
+            StopAllCoroutines();
             _cube.ResetToSolved();
-            ScrambleLength = _cube.Scramble(_scrambleMoves);
             Score = 0;
             GameOver = false;
-            MatchInProgress = true;
+            MatchInProgress = false;
 
             _cube.OnCubeChanged -= OnCubeStateChanged;
             _cube.OnCubeChanged += OnCubeStateChanged;
 
+            StartCoroutine(AnimatedStartSequence());
+        }
+
+        private System.Collections.IEnumerator AnimatedStartSequence()
+        {
+            var renderer = _cube.GetComponent<RubikRenderer>();
+
+            // 1. Pulse sticker emissivity for 2 seconds
+            if (renderer != null)
+                yield return renderer.PulseEmission(2f);
+
+            // 2. DEBUG: deterministic 3-move scramble: F CW, U CW, R CW
+            //    Expected state after each move on a solved cube:
+            //    F CW: U bottom row → R left col, R left col → D top row(rev), D top row → L right col, L right col → U bottom row
+            //    U CW: F top row → R top row, R top row → B top row, B top row → L top row, L top row → F top row
+            //    R CW: U right col → B left col(rev), F right col → U right col, D right col → F right col, B left col(rev) → D right col
+            //    To solve: R CCW, U CCW, F CCW
+            var debugScramble = new (int face, int dir)[]
+            {
+                (RubikCube.F, 1),   // F CW
+                (RubikCube.U, 1),   // U CW
+                (RubikCube.R, 1),   // R CW
+            };
+            for (int i = 0; i < debugScramble.Length; i++)
+            {
+                var (face, dir) = debugScramble[i];
+                Debug.Log($"[SCRAMBLE] Move {i+1}/{debugScramble.Length}: {RubikCube.FaceNames[face]} {(dir == 1 ? "CW" : "CCW")}");
+                _cube.RotateFace(face, dir);
+
+                // Wait for animation to finish + minimum 500ms between moves
+                float waited = 0f;
+                while (waited < 0.5f || (renderer != null && renderer.IsBusy))
+                {
+                    waited += Time.deltaTime;
+                    yield return null;
+                }
+            }
+
+            // 3. Scramble complete — begin match
+            _cube.ResetMoveCount();
+            ScrambleLength = _scrambleMoves;
+            MatchInProgress = true;
             OnMatchStarted?.Invoke();
-            OnCubeChanged?.Invoke();
         }
 
         // ═══════════════════════════════════════════════════════════════

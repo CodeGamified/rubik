@@ -1,6 +1,3 @@
-[submodule "Rubik/Assets/engine"]
-	path = Rubik/Assets/engine
-	url = https://github.com/CodeGamified/.engine.git
 [submodule "Rubik/Assets/Engine"]
 	path = Rubik/Assets/Engine
 	url = https://github.com/CodeGamified/.engine.git

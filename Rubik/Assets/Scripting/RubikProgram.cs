@@ -279,11 +279,10 @@ elif stickers < 54:
             if (_executor == null || _program == null || _isPaused) return;
             if (_match == null || !_match.MatchInProgress || _match.GameOver) return;
 
-            // Wait for the renderer's face-rotation animation to finish
+            // Wait for the renderer to finish all pending animations
             // before executing the next instruction.  Without this, moves
-            // arrive faster than animations complete, causing cubies to
-            // snap from partial rotation to final position in one frame.
-            if (_renderer != null && _renderer.IsAnimating)
+            // arrive faster than animations complete, causing visual jumps.
+            if (_renderer != null && _renderer.IsBusy)
             {
                 _opAccumulator = 0f;
                 return;
